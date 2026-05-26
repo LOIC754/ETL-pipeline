@@ -1,0 +1,166 @@
+version: '3.8'  # version du format docker-compose utilisé
+
+services:  # déclaration de tous les conteneurs
+
+  # ═══════════════════════════════════════════
+  # ZOOKEEPER
+  # Kafka ne peut pas fonctionner seul : il a besoin
+  # de Zookeeper pour coordonner les brokers,
+  # gérer les élections de leader et stocker
+  # les métadonnées du cluster.
+  # ═══════════════════════════════════════════
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0  # image officielle Confluent (éditeur de Kafka)
+    container_name: zookeeper               # nom fixe pour qu'on puisse y référer par nom
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181           # port sur lequel Kafka contacte Zookeeper
+      ZOOKEEPER_TICK_TIME: 2000             # intervalle de heartbeat en ms (détecte si un nœud est mort)
+    ports:
+      - "2181:2181"                         # expose le port 2181 du conteneur sur le port 2181 du host
+
+  # ═══════════════════════════════════════════
+  # KAFKA
+  # Le broker de messages : reçoit les cours CAC40
+  # du producer et les met à disposition du consumer.
+  # ═══════════════════════════════════════════
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0      # même version que Zookeeper, obligatoire (compatibilité)
+    container_name: kafka
+    depends_on:
+      - zookeeper                           # Kafka démarre APRÈS Zookeeper (dépendance de démarrage)
+    ports:
+      - "9092:9092"                         # port interne : utilisé par les autres conteneurs Docker
+      - "29092:29092"                       # port externe : utilisé par ton code Python sur le host
+    environment:
+      KAFKA_BROKER_ID: 1                    # identifiant unique du broker (utile si cluster multi-brokers)
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181  # adresse Zookeeper — "zookeeper" = nom du conteneur ci-dessus
+      # LISTENERS : Kafka doit savoir sur quelle adresse répondre selon qui l'appelle
+      # PLAINTEXT     → pour les appels depuis l'intérieur du réseau Docker (ex: Kafdrop)
+      # PLAINTEXT_HOST → pour les appels depuis l'extérieur Docker (ex: ton producer.py)
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT  # pas de TLS ici, projet local
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT  # les brokers entre eux utilisent PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1    # 1 seul broker → réplication impossible, on met 1
+
+  # ═══════════════════════════════════════════
+  # KAFDROP
+  # Interface web pour visualiser Kafka :
+  # voir les topics, les partitions, les messages.
+  # Équivalent de pgAdmin pour PostgreSQL.
+  # ═══════════════════════════════════════════
+  kafdrop:
+    image: obsidiandynamics/kafdrop:latest
+    container_name: kafdrop
+    depends_on:
+      - kafka                               # démarre après Kafka
+    ports:
+      - "9001:9000"                         # UI Kafdrop sur localhost:9001
+    environment:
+      KAFKA_BROKERCONNECT: kafka:9092       # adresse du broker Kafka (nom conteneur + port interne)
+
+  # ═══════════════════════════════════════════
+  # MINIO
+  # Stockage objet S3-compatible : reçoit les JSON
+  # bruts du consumer (couche Bronze).
+  # Identique à AWS S3 dans l'API, gratuit en local.
+  # ═══════════════════════════════════════════
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    ports:
+      - "9000:9000"                         # port API S3 (boto3 s'y connecte)
+      - "9002:9002"                         # port console web http://localhost:9002
+    environment:
+      MINIO_ROOT_USER: admin                # identifiant = AWS_ACCESS_KEY_ID dans boto3
+      MINIO_ROOT_PASSWORD: password123      # mot de passe = AWS_SECRET_ACCESS_KEY dans boto3
+    command: server /data --address ":9000" --console-address ":9002"  # démarre le serveur, stocke dans /data, console sur 9002
+    volumes:
+      - minio_data:/data                    # volume persistant : les fichiers survivent au redémarrage du conteneur
+
+  # ═══════════════════════════════════════════
+  # POSTGRESQL
+  # Base de données utilisée par Airflow pour stocker
+  # ses métadonnées : état des DAGs, logs d'exécution,
+  # variables, connexions. Airflow ne peut pas tourner sans.
+  # ═══════════════════════════════════════════
+  postgres:
+    image: postgres:15
+    container_name: postgres_airflow
+    environment:
+      POSTGRES_USER: airflow                # utilisateur PostgreSQL
+      POSTGRES_PASSWORD: airflow            # mot de passe
+      POSTGRES_DB: airflow                  # nom de la base créée automatiquement
+    ports:
+      - "5432:5432"                         # port standard PostgreSQL
+
+  # ═══════════════════════════════════════════
+  # AIRFLOW INIT
+  # Conteneur one-shot : s'exécute une seule fois
+  # au premier lancement pour initialiser les tables
+  # Airflow dans PostgreSQL. S'arrête tout seul après.
+  # ═══════════════════════════════════════════
+  airflow-init:
+    image: apache/airflow:2.9.0
+    container_name: airflow_init
+    depends_on:
+      - postgres                            # PostgreSQL doit exister avant d'initialiser
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor                        # exécute les tâches localement (pas Kubernetes)
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow  # connexion à PostgreSQL
+      AIRFLOW__CORE__FERNET_KEY: ''                                 # clé de chiffrement (vide = désactivé, ok en local)
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'                         # ne pas charger les DAGs d'exemple Airflow
+    command: db init                        # commande unique : crée les tables Airflow dans PostgreSQL
+
+  # ═══════════════════════════════════════════
+  # AIRFLOW SCHEDULER
+  # Le cœur d'Airflow : surveille les DAGs,
+  # décide quand les exécuter selon le schedule,
+  # et soumet les tâches à l'executor.
+  # ═══════════════════════════════════════════
+  airflow-scheduler:
+    image: apache/airflow:2.9.0
+    container_name: airflow_scheduler
+    depends_on:
+      - airflow-init                        # la DB doit être initialisée avant de démarrer
+      - postgres
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__FERNET_KEY: ''
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    volumes:
+      - ../dags:/opt/airflow/dags           # monte le dossier local dags/ dans le conteneur Airflow
+                                            # tout fichier .py ajouté dans dags/ est détecté automatiquement
+    command: scheduler                      # démarre le processus scheduler
+    restart: on-failure                     # redémarre automatiquement si crash
+
+  # ═══════════════════════════════════════════
+  # AIRFLOW WEBSERVER
+  # L'interface web d'Airflow : voir les DAGs,
+  # déclencher des runs manuels, consulter les logs.
+  # ═══════════════════════════════════════════
+  airflow-webserver:
+    image: apache/airflow:2.9.0
+    container_name: airflow_webserver
+    depends_on:
+      - airflow-scheduler                   # le scheduler doit tourner avant d'ouvrir l'UI
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__FERNET_KEY: ''
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    volumes:
+      - ../dags:/opt/airflow/dags           # même montage que le scheduler (ils lisent les mêmes DAGs)
+    ports:
+      - "8080:8080"                         # UI accessible sur http://localhost:8080
+    command: webserver                      # démarre le processus webserver
+    restart: on-failure
+
+# ═══════════════════════════════════════════
+# VOLUMES
+# Déclaration des volumes nommés Docker.
+# Sans ça, les données MinIO sont perdues
+# à chaque docker compose down.
+# ═══════════════════════════════════════════
+volumes:
+  minio_data:                               # volume persistant pour MinIO uniquement

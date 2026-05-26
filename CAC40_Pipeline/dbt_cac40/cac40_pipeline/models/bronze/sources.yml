@@ -1,0 +1,12 @@
+version: 2
+
+sources:
+  - name: raw
+    database: CAC40_MDS
+    schema: COMMON
+    tables:
+      - name: BRONZE_CAC40_QUOTES_RAW
+        description: "Table bronze raw — JSON brut CAC40 chargé par Airflow"
+        columns:
+          - name: V
+            description: "Colonne VARIANT contenant le JSON complet"
